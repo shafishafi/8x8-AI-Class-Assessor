@@ -224,7 +224,6 @@ Reco_Class/
 ├── .env.example            # Template for required environment variables (API keys)
 ├── .env                    # Local environment file (contains your GEMINI_API_KEY — not committed to Git)
 ├── README.md               # User documentation, quick-start guide, and architectural reference
-├── CONVERSATION_HISTORY.md # Complete transcript of engineering decisions and user requests
 ├── log.md                  # Comprehensive, timestamped application audit log
 ├── APP.md                  # Original product specification and evaluation prompt instructions
 ├── PLAN.md                 # Technical implementation plan and architectural milestones
