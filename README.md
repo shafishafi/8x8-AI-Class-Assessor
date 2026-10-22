@@ -70,6 +70,7 @@ The app will start and automatically open in your default browser at:
 - [How to Run (Quick Start)](#-how-to-run-quick-start)
 - [Overview](#-overview)
 - [Key Features](#-key-features)
+- [Screenshots & User Interface](#-screenshots--user-interface)
 - [The 8x8 Evaluation Rubric](#-the-8x8-evaluation-rubric)
 - [Application Usage & Workflow](#-application-usage--workflow)
 - [Architecture & Tech Stack](#-architecture--tech-stack)
@@ -111,6 +112,20 @@ Instead of producing subjective or generic summaries, the AI assessor acts as a 
   - Gemini Files API cloud storage is explicitly deleted (`client.files.delete()`) in a guaranteed `finally` block.
 - **Production Resilience**:
   - Implements exponential backoff with randomized jitter to gracefully handle Gemini `503 UNAVAILABLE` (high traffic) and `429` (rate limits).
+
+---
+
+## 📸 Screenshots & User Interface
+
+### 1. Dual Video & Transcript Ingestion
+Side-by-side uploaders for the primary class recording and optional subtitle/transcript files (`.srt`, `.vtt`, `.txt`), with integrated video player preview:
+
+![8x8 AI Class Assessor - Video & Transcript Upload Interface](assets/images/upload_interface.png)
+
+### 2. Comprehensive Assessment Dashboard
+Evidence-based evaluation output displaying the overall grade badge, 8x8 rubric compliance checklist, actionable pedagogical feedback, and timestamped evidence log:
+
+![8x8 AI Class Assessor - Assessment Results Dashboard](assets/images/assessment_dashboard.png)
 
 ---
 
@@ -208,9 +223,13 @@ Reco_Class/
 ├── requirements.txt        # Pinned Python package dependencies
 ├── .env.example            # Template for required environment variables (API keys)
 ├── .env                    # Local environment file (contains your GEMINI_API_KEY — not committed to Git)
+├── README.md               # User documentation, quick-start guide, and architectural reference
+├── CONVERSATION_HISTORY.md # Complete transcript of engineering decisions and user requests
 ├── log.md                  # Comprehensive, timestamped application audit log
 ├── APP.md                  # Original product specification and evaluation prompt instructions
 ├── PLAN.md                 # Technical implementation plan and architectural milestones
+├── assets/
+│   └── images/             # Visual documentation screenshots for upload interface & dashboard
 ├── .streamlit/
 │   └── config.toml         # Streamlit server settings (auto-reload on save, headless mode, maxUploadSize)
 └── .gitignore              # Ignores .env, virtual environments, caches, and temp artifacts
