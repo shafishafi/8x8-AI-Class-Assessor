@@ -5,6 +5,7 @@
 # =============================================================================
 
 # ── Phase 1: Imports ──────────────────────────────────────────────────────────
+import json
 import logging
 import os
 import random
@@ -37,6 +38,96 @@ logger = logging.getLogger(__name__)
 
 # Initialise Gemini client (fails loudly if key is missing)
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+
+# Path to shared local quota lock file across sessions
+QUOTA_LOCK_FILE = os.path.join(tempfile.gettempdir(), "gemini_quota_lock.json")
+
+
+def get_gemini_api_key() -> str | None:
+    """Returns active Gemini API key from environment."""
+    return os.environ.get("GEMINI_API_KEY")
+
+
+def get_quota_unlock_time() -> float | None:
+    """Returns target unlock timestamp if quota limit is active, otherwise None."""
+    # Check session state first
+    if "gemini_quota_unlock_time" in st.session_state:
+        t = st.session_state["gemini_quota_unlock_time"]
+        if t > time.time():
+            return t
+        st.session_state.pop("gemini_quota_unlock_time", None)
+
+    # Check shared disk lock file
+    if os.path.exists(QUOTA_LOCK_FILE):
+        try:
+            with open(QUOTA_LOCK_FILE, "r") as f:
+                data = json.load(f)
+                unlock_time = data.get("unlock_time", 0)
+                if unlock_time > time.time():
+                    st.session_state["gemini_quota_unlock_time"] = unlock_time
+                    return unlock_time
+                else:
+                    os.remove(QUOTA_LOCK_FILE)
+        except Exception:
+            pass
+    return None
+
+
+def set_quota_unlock_time(retry_seconds: float, error_msg: str = "") -> None:
+    """Stores quota unlock timestamp in session state and lock file."""
+    unlock_time = time.time() + retry_seconds
+    st.session_state["gemini_quota_unlock_time"] = unlock_time
+    st.session_state["gemini_quota_retry_seconds"] = retry_seconds
+    st.session_state["gemini_quota_error_msg"] = error_msg
+    try:
+        with open(QUOTA_LOCK_FILE, "w") as f:
+            json.dump({"unlock_time": unlock_time, "error_msg": error_msg}, f)
+    except Exception:
+        pass
+
+
+def clear_quota_unlock_time() -> None:
+    """Clears quota unlock timestamp from session state and lock file."""
+    st.session_state.pop("gemini_quota_unlock_time", None)
+    st.session_state.pop("gemini_quota_retry_seconds", None)
+    st.session_state.pop("gemini_quota_error_msg", None)
+    if os.path.exists(QUOTA_LOCK_FILE):
+        try:
+            os.remove(QUOTA_LOCK_FILE)
+        except Exception:
+            pass
+
+
+class QuotaExceededError(Exception):
+    """Raised when the Gemini API returns a 429 RESOURCE_EXHAUSTED daily quota limit."""
+    def __init__(self, retry_seconds: float, message: str):
+        super().__init__(message)
+        self.retry_seconds = retry_seconds
+        self.unlock_timestamp = time.time() + retry_seconds
+        self.message = message
+
+
+def extract_retry_delay_from_error(err_text: str) -> float:
+    """Extract retry delay in seconds from Gemini 429 error messages or details."""
+    m_delay = re.search(r"['\"]retryDelay['\"]\s*:\s*['\"](\d+)s?['\"]", err_text)
+    if m_delay:
+        return float(m_delay.group(1))
+
+    m_text = re.search(
+        r"retry in\s+(?:(\d+)d\s*)?(?:(\d+)h\s*)?(?:(\d+)m\s*)?(?:([0-9\.]+)s)?",
+        err_text,
+        re.IGNORECASE,
+    )
+    if m_text:
+        d = int(m_text.group(1) or 0)
+        h = int(m_text.group(2) or 0)
+        m = int(m_text.group(3) or 0)
+        s = float(m_text.group(4) or 0)
+        total = d * 86400 + h * 3600 + m * 60 + s
+        if total > 0:
+            return total
+
+    return 3600.0
 
 # ── Phase 2: Pydantic Output Schema ──────────────────────────────────────────
 
@@ -319,7 +410,8 @@ def generate_content_with_backoff(
 ):
     """
     Calls client.models.generate_content with exponential backoff and jitter.
-    Handles 503 (UNAVAILABLE / High Demand) and 429 (Rate Limits) automatically.
+    Handles 503 (UNAVAILABLE / High Demand) and transient rate limits automatically.
+    If daily quota is exhausted (RESOURCE_EXHAUSTED / 429 with long retryDelay), raises QuotaExceededError.
     """
     for attempt in range(1, max_retries + 1):
         try:
@@ -330,10 +422,20 @@ def generate_content_with_backoff(
             )
         except Exception as exc:
             err_msg = str(exc)
-            # Check for transient error codes or phrases
+
+            # Check if this is a daily quota exhaustion limit
+            if any(term in err_msg for term in ["RESOURCE_EXHAUSTED", "429", "Quota exceeded", "quotaMetric"]):
+                retry_sec = extract_retry_delay_from_error(err_msg)
+                if retry_sec > 60:
+                    logger.error(
+                        f"[QUOTA] Gemini daily request quota exhausted. Reset in {retry_sec}s. Aborting retries."
+                    )
+                    raise QuotaExceededError(retry_seconds=retry_sec, message=err_msg)
+
+            # Check for transient error codes or phrases (e.g. temporary 503 spike)
             is_transient = any(
                 code in err_msg
-                for code in ["503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "high demand", "overloaded"]
+                for code in ["503", "UNAVAILABLE", "high demand", "overloaded"]
             )
 
             if not is_transient or attempt == max_retries:
@@ -385,9 +487,99 @@ Rules:
         )
         if response and response.text:
             return response.text.strip()
+    except QuotaExceededError:
+        raise
     except Exception as exc:
         logger.warning(f"[TRANSCRIPT] Automatic transcription failed: {exc}")
     return None
+
+
+def render_quota_countdown_and_button(tab_key: str, button_label: str = "🚀 Analyse Recording") -> bool:
+    """
+    Renders a live countdown timer when Gemini 429 quota is active,
+    disables the analyse button until the timer reaches zero,
+    and automatically makes the button available when the timer expires.
+    """
+    unlock_time = get_quota_unlock_time()
+    now = time.time()
+
+    if unlock_time is not None:
+        remaining_sec = int(unlock_time - now)
+
+        if remaining_sec <= 0:
+            clear_quota_unlock_time()
+            st.success("🎉 **Quota reset timer has completed!** The Analyse button is now active.")
+            unlock_time = None
+        else:
+            h = remaining_sec // 3600
+            m = (remaining_sec % 3600) // 60
+            s = remaining_sec % 60
+            initial_display = f"{h:02d}h : {m:02d}m : {s:02d}s"
+            unlock_ms = int(unlock_time * 1000)
+
+            st.markdown(f"""
+            <div style="background:#fff1f2;border:2px solid #fecdd3;border-radius:12px;padding:1.2rem;margin:1rem 0;box-shadow:0 4px 6px -1px rgba(0,0,0,0.05);">
+              <div style="display:flex;align-items:center;gap:0.75rem;margin-bottom:0.6rem;">
+                <span style="font-size:1.8rem;">⏳</span>
+                <div>
+                  <h3 style="margin:0;color:#9f1239;font-size:1.1rem;font-weight:700;">Gemini API Quota Limit Exceeded (429)</h3>
+                  <p style="margin:0.2rem 0 0 0;color:#881337;font-size:0.88rem;">
+                    Google Gemini Free Tier daily limit reached (20 requests/day per model). The Analyse button is locked until the countdown timer expires.
+                  </p>
+                </div>
+              </div>
+              <div style="background:#ffffff;border:1px solid #fda4af;border-radius:8px;padding:1rem;text-align:center;margin:0.6rem 0;">
+                <div style="font-size:0.8rem;color:#64748b;font-weight:600;text-transform:uppercase;letter-spacing:0.05em;">Quota Reset Countdown</div>
+                <div id="countdown_{tab_key}" style="font-size:2.2rem;font-weight:800;color:#e11d48;font-family:monospace;margin:0.3rem 0;">
+                  {initial_display}
+                </div>
+                <div id="status_{tab_key}" style="font-size:0.85rem;color:#64748b;">
+                  Ticking live in real-time. Button unlocks automatically at 00h : 00m : 00s.
+                </div>
+              </div>
+            </div>
+            <script>
+              (function() {{
+                var target = {unlock_ms};
+                function tick() {{
+                  var now = new Date().getTime();
+                  var diff = target - now;
+                  var elTimer = document.getElementById("countdown_{tab_key}");
+                  var elStatus = document.getElementById("status_{tab_key}");
+                  if (!elTimer) return;
+                  if (diff <= 0) {{
+                    elTimer.innerHTML = "00h : 00m : 00s";
+                    if (elStatus) elStatus.innerHTML = "🎉 Quota timer completed! Unlocking button now...";
+                    setTimeout(function() {{
+                      window.parent.location.reload();
+                    }}, 1500);
+                    return;
+                  }}
+                  var hours = Math.floor(diff / 3600000);
+                  var mins = Math.floor((diff % 3600000) / 60000);
+                  var secs = Math.floor((diff % 60000) / 1000);
+                  var pad = function(n) {{ return n < 10 ? '0' + n : n; }};
+                  elTimer.innerHTML = pad(hours) + "h : " + pad(mins) + "m : " + pad(secs) + "s";
+                }}
+                tick();
+                setInterval(tick, 1000);
+              }})();
+            </script>
+            """, unsafe_allow_html=True)
+
+            col_opt1, col_opt2 = st.columns([2, 1.5])
+            with col_opt2:
+                if st.button("🔄 Test Quota / Reset Timer", key=f"reset_timer_{tab_key}", use_container_width=True):
+                    clear_quota_unlock_time()
+                    st.rerun()
+
+
+            # Render disabled button while timer is active
+            st.button(f"⏳ {button_label} (Locked by Quota Timer)", key=f"btn_{tab_key}", disabled=True)
+            return False
+
+    # Timer not active or expired: render primary interactive button
+    return st.button(button_label, key=f"btn_{tab_key}", type="primary")
 
 
 def process_video(
@@ -402,12 +594,13 @@ def process_video(
     Inspects video for embedded transcription or processes sidecar subtitles.
     Guarantees cleanup of local temp file and Gemini-hosted file in finally block.
     """
-    if not GEMINI_API_KEY:
-        st.error("❌ `GEMINI_API_KEY` is not set. Add it to your `.env` file.")
+    api_key = get_gemini_api_key()
+    if not api_key:
+        st.error("❌ `GEMINI_API_KEY` is not set. Add it to your `.env` file or Streamlit Secrets.")
         logger.error("[CONFIG] GEMINI_API_KEY is missing. Aborting.")
         return
 
-    client = genai.Client(api_key=GEMINI_API_KEY)
+    client = genai.Client(api_key=api_key)
     video_file = None  # track so finally block knows whether to call delete
 
     try:
@@ -509,9 +702,21 @@ MANDATORY INSTRUCTION: Cross-reference your evaluation with the transcript above
         st.session_state[f"assessment_{tab_key}"] = assessment
         st.session_state[f"just_completed_{tab_key}"] = True
 
+    except QuotaExceededError as q_err:
+        logger.error(f"[QUOTA] Daily quota limit reached: unlock in {q_err.retry_seconds}s")
+        set_quota_unlock_time(q_err.retry_seconds, q_err.message)
+        st.rerun()
+
     except Exception as exc:
-        logger.exception(f"[ERROR] An error occurred during processing: {exc}")
-        st.error(f"❌ An error occurred: {exc}")
+        err_msg = str(exc)
+        if any(term in err_msg for term in ["RESOURCE_EXHAUSTED", "429", "Quota exceeded", "quotaMetric"]):
+            retry_sec = extract_retry_delay_from_error(err_msg)
+            logger.error(f"[QUOTA] Daily quota limit reached: unlock in {retry_sec}s")
+            set_quota_unlock_time(retry_sec, err_msg)
+            st.rerun()
+        else:
+            logger.exception(f"[ERROR] An error occurred during processing: {exc}")
+            st.error(f"❌ An error occurred: {exc}")
 
     finally:
         # ── Phase 6: Guaranteed Cleanup ───────────────────────────────────
@@ -578,7 +783,10 @@ with tab_upload:
     if uploaded_file is not None:
         st.video(uploaded_file)
 
-        if st.button("🚀 Analyse Recording", key="btn_upload", type="primary"):
+    if render_quota_countdown_and_button(tab_key="upload", button_label="🚀 Analyse Recording"):
+        if uploaded_file is None:
+            st.warning("⚠️ Please select and upload a video file before submitting.")
+        else:
             logger.info(f"[UPLOAD] User submitted file upload: '{uploaded_file.name}'")
 
             # Save to a named temp file (delete=False so we control cleanup)
@@ -643,7 +851,7 @@ with tab_url:
             label_visibility="collapsed",
         )
 
-    if st.button("🚀 Analyse Recording", key="btn_url", type="primary"):
+    if render_quota_countdown_and_button(tab_key="url", button_label="🚀 Analyse Recording"):
         if not video_url.strip():
             st.warning("⚠️ Please enter a video URL before submitting.")
         else:
