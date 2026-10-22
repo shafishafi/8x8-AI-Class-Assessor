@@ -1,5 +1,16 @@
+# 8x8 AI Class Assessor Dependencies
+
+# Web Application UI Framework
 streamlit>=1.35.0
+
+# Google Gemini Multimodal AI SDK (Gemini 3.8 Flash)
 google-genai>=1.0.0
-python-dotenv>=1.0.0
-requests>=2.31.0
+
+# Structured Output & Rubric Schema Validation
 pydantic>=2.0.0
+
+# Video Ingestion & Google Drive Large-File Resolution
+requests>=2.31.0
+
+# Environment Variable Management (.env)
+python-dotenv>=1.0.0
